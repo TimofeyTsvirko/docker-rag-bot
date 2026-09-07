@@ -1,0 +1,26 @@
+[
+  {
+    "query": "How to create a Docker volume?",
+    "relevant_sources": ["volumes.md"]
+  },
+  {
+    "query": "Как смонтировать volume в контейнер?",
+    "relevant_sources": ["volumes.md"]
+  },
+  {
+    "query": "What is docker-compose?",
+    "relevant_sources": ["compose.md"]
+  },
+  {
+    "query": "Как ограничить память контейнера?",
+    "relevant_sources": ["resources.md"]
+  },
+  {
+    "query": "Dockerfile multi-stage build example",
+    "relevant_sources": ["dockerfile.md"]
+  },
+  {
+    "query": "Разница между named volume и bind mount",
+    "relevant_sources": ["volumes.md"]
+  }
+]
