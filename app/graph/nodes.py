@@ -20,14 +20,26 @@ def _load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-# ---------- Structured output schemas ----------
-
 class ModerationResult(BaseModel):
     is_relevant: bool = Field(description="Whether the query is relevant to Docker/containers")
     reason: str = Field(description="Short explanation")
 
 
-# ---------- Nodes ----------
+def _docs_from_search(query: str) -> list[DocumentInfo]:
+    results = vector_search.invoke({"query": query})
+    documents: list[DocumentInfo] = []
+    for r in results:
+        documents.append(
+            DocumentInfo(
+                content=r["content"],
+                source=r["source"],
+                score=r["score"],
+                metadata=r.get("metadata", {}),
+            )
+        )
+    logger.info("vector_search query=%r -> %d docs", query, len(documents))
+    return documents
+
 
 def moderation_node(state: AgentState) -> dict:
     """Guardrail: filter out irrelevant queries."""
@@ -57,54 +69,70 @@ def moderation_node(state: AgentState) -> dict:
 
 def rag_agent_node(state: AgentState) -> dict:
     """
-    RAG agent that decides to call the vector_search tool.
-    Uses tool-calling LLM.
+    RAG agent: asks the LLM to call vector_search.
+    If the model does not emit tool_calls, we still force a search with the user query.
     """
     llm = get_llm().bind_tools([vector_search])
     system = _load_prompt("rag_agent")
+    query = state["query"]
 
-    # Build conversation context
-    history = state.get("messages", [])
-    messages = [SystemMessage(content=system)] + list(history)
-    if not any(isinstance(m, HumanMessage) for m in history):
-        messages.append(HumanMessage(content=state["query"]))
+    # Do not pass moderation noise — only the user query
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=query),
+    ]
 
     response = llm.invoke(messages)
+
+    # Force tool call if model answered without one
+    if not getattr(response, "tool_calls", None):
+        logger.warning("RAG agent did not call tools — forcing vector_search")
+        documents = _docs_from_search(query)
+        return {
+            "messages": [response],
+            "documents": documents,
+        }
+
     return {"messages": [response]}
 
 
 def tool_node(state: AgentState) -> dict:
-    """Execute tools requested by the RAG agent (ToolNode equivalent)."""
+    """Execute tools requested by the RAG agent."""
     last = state["messages"][-1]
-    if not isinstance(last, AIMessage) or not last.tool_calls:
-        return {"documents": state.get("documents", [])}
-
-    documents: list[DocumentInfo] = []
+    documents: list[DocumentInfo] = list(state.get("documents") or [])
     tool_messages = []
 
-    for call in last.tool_calls:
-        if call["name"] == "vector_search":
-            query = call["args"].get("query", state["query"])
-            results = vector_search.invoke({"query": query})
-            for r in results:
-                documents.append(
-                    DocumentInfo(
-                        content=r["content"],
-                        source=r["source"],
-                        score=r["score"],
-                        metadata=r.get("metadata", {}),
+    if isinstance(last, AIMessage) and last.tool_calls:
+        for call in last.tool_calls:
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+            call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", "")
+
+            if name == "vector_search":
+                q = (args or {}).get("query") or state["query"]
+                results = vector_search.invoke({"query": q})
+                for r in results:
+                    documents.append(
+                        DocumentInfo(
+                            content=r["content"],
+                            source=r["source"],
+                            score=r["score"],
+                            metadata=r.get("metadata", {}),
+                        )
+                    )
+                tool_messages.append(
+                    ToolMessage(
+                        content=json.dumps(results, ensure_ascii=False)[:8000],
+                        tool_call_id=call_id,
                     )
                 )
-            tool_messages.append(
-                ToolMessage(
-                    content=json.dumps(results, ensure_ascii=False),
-                    tool_call_id=call["id"],
+            else:
+                tool_messages.append(
+                    ToolMessage(content=f"Unknown tool {name}", tool_call_id=call_id)
                 )
-            )
-        else:
-            tool_messages.append(
-                ToolMessage(content=f"Unknown tool {call['name']}", tool_call_id=call["id"])
-            )
+    elif not documents:
+        # Safety net
+        documents = _docs_from_search(state["query"])
 
     return {
         "documents": documents,
@@ -114,24 +142,36 @@ def tool_node(state: AgentState) -> dict:
 
 def writer_node(state: AgentState) -> dict:
     """Form final answer from query + retrieved documents."""
+    docs = state.get("documents") or []
+    query = state.get("query", "")
+
+    if not docs:
+        if any("а" <= c.lower() <= "я" or c in "ёЁ" for c in query):
+            answer = (
+                "В базе знаний не нашлось релевантных документов по вашему запросу. "
+                "Проверьте, что /ingest завершился успешно, и попробуйте переформулировать вопрос."
+            )
+        else:
+            answer = (
+                "No relevant documents were found in the knowledge base for your query. "
+                "Ensure /ingest succeeded and try rephrasing the question."
+            )
+        return {
+            "answer": answer,
+            "messages": [AIMessage(content=answer)],
+        }
+
     llm = get_llm()
     system = _load_prompt("writer")
 
-    docs = state.get("documents") or []
-    if docs:
-        context_parts = []
-        for i, d in enumerate(docs, 1):
-            context_parts.append(
-                f"[Document {i} | source: {d['source']} | score: {d['score']:.3f}]\n{d['content']}"
-            )
-        context = "\n\n".join(context_parts)
-    else:
-        context = "No relevant documents were retrieved."
+    context_parts = []
+    for i, d in enumerate(docs, 1):
+        context_parts.append(
+            f"[Document {i} | source: {d['source']} | score: {d['score']:.3f}]\n{d['content']}"
+        )
+    context = "\n\n".join(context_parts)
 
-    user_content = (
-        f"User query: {state['query']}\n\n"
-        f"Retrieved documents:\n{context}"
-    )
+    user_content = f"User query: {query}\n\nRetrieved documents:\n{context}"
 
     messages = [
         SystemMessage(content=system),
@@ -147,7 +187,6 @@ def writer_node(state: AgentState) -> dict:
 
 
 def refuse_node(state: AgentState) -> dict:
-    """Produce polite refusal for irrelevant queries."""
     reason = state.get("moderation_reason", "query is outside the knowledge domain")
     answer = (
         f"Извините, я могу отвечать только на вопросы, связанные с Docker, контейнерами "
@@ -161,8 +200,6 @@ def refuse_node(state: AgentState) -> dict:
     }
 
 
-# ---------- Routing ----------
-
 def route_after_moderation(state: AgentState) -> Literal["rag_agent", "refuse"]:
     if state.get("is_relevant", False):
         return "rag_agent"
@@ -170,7 +207,11 @@ def route_after_moderation(state: AgentState) -> Literal["rag_agent", "refuse"]:
 
 
 def route_after_rag(state: AgentState) -> Literal["tools", "writer"]:
+    # If documents already filled (forced search), skip tools
+    if state.get("documents"):
+        return "writer"
     last = state["messages"][-1]
-    if isinstance(last, AIMessage) and last.tool_calls:
+    if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "tools"
-    return "writer"
+    # No tool calls and no docs — still try tools safety path
+    return "tools"
