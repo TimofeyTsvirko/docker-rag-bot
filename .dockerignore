@@ -4,10 +4,11 @@ __pycache__
 .git
 .gitignore
 .env
-*.md
 .ruff_cache
 .pytest_cache
 .mypy_cache
 tests
 .python-version
 uv.lock
+*.log
+.DS_Store
