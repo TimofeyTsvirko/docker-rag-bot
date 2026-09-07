@@ -144,22 +144,6 @@ docker compose logs -f app
 docker compose down
 ```
 
-## Полезные команды uv
-
-```bash
-# установить / обновить зависимости
-uv sync
-
-# добавить пакет
-uv add some-package
-
-# запустить любой скрипт в окружении проекта
-uv run python scripts/download_docs.py --help
-uv run python -m app.evaluation.retrieval_eval
-
-# экспорт requirements.txt (если нужен)
-uv export --no-dev -o requirements.txt
-```
 
 ---
 
