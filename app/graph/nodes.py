@@ -51,9 +51,15 @@ def moderation_node(state: AgentState) -> dict:
         SystemMessage(content=system),
         HumanMessage(content=query),
     ]
+    reset = {
+        "documents": [],
+        "answer": "",
+        "needs_retrieval": True,
+    }
     try:
         result: ModerationResult = llm.invoke(messages)
         return {
+            **reset,
             "is_relevant": result.is_relevant,
             "moderation_reason": result.reason,
             "messages": [AIMessage(content=f"[moderation] relevant={result.is_relevant}: {result.reason}")],
@@ -61,6 +67,7 @@ def moderation_node(state: AgentState) -> dict:
     except Exception as e:
         logger.exception("Moderation failed, defaulting to relevant")
         return {
+            **reset,
             "is_relevant": True,
             "moderation_reason": f"fallback: {e}",
             "messages": [AIMessage(content="[moderation] fallback to relevant")],
@@ -76,11 +83,21 @@ def rag_agent_node(state: AgentState) -> dict:
     system = _load_prompt("rag_agent")
     query = state["query"]
 
-    # Do not pass moderation noise — only the user query
-    messages = [
-        SystemMessage(content=system),
-        HumanMessage(content=query),
-    ]
+    history: list = []
+    for m in state.get("messages") or []:
+        if isinstance(m, HumanMessage):
+            history.append(m)
+        elif isinstance(m, AIMessage) and m.content and not str(m.content).startswith("[moderation]"):
+            # Skip pure tool-call messages that have no text
+            if not getattr(m, "tool_calls", None) or (isinstance(m.content, str) and m.content.strip()):
+                history.append(m)
+
+    # Limit history length
+    history = history[-8:]
+
+    messages = [SystemMessage(content=system)] + history
+    if not history or not isinstance(history[-1], HumanMessage) or history[-1].content != query:
+        messages.append(HumanMessage(content=query))
 
     response = llm.invoke(messages)
 
@@ -207,11 +224,11 @@ def route_after_moderation(state: AgentState) -> Literal["rag_agent", "refuse"]:
 
 
 def route_after_rag(state: AgentState) -> Literal["tools", "writer"]:
-    # If documents already filled (forced search), skip tools
-    if state.get("documents"):
-        return "writer"
-    last = state["messages"][-1]
+    last = state["messages"][-1] if state.get("messages") else None
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "tools"
-    # No tool calls and no docs — still try tools safety path
+    # Forced-search path in rag_agent_node already set documents for this turn
+    if state.get("documents"):
+        return "writer"
+    # Safety: still go to tools so tool_node can run a fallback search
     return "tools"

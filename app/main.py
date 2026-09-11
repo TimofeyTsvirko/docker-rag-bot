@@ -59,11 +59,6 @@ def _run_graph(query: str, thread_id: str) -> Dict[str, Any]:
         "messages": [HumanMessage(content=query)],
         "query": query,
         "thread_id": thread_id,
-        "is_relevant": False,
-        "moderation_reason": "",
-        "documents": [],
-        "answer": "",
-        "needs_retrieval": True,
     }
     result = graph.invoke(initial, config=config)
     return result
@@ -114,11 +109,6 @@ async def query_stream(req: QueryRequest):
         "messages": [HumanMessage(content=req.query)],
         "query": req.query,
         "thread_id": thread_id,
-        "is_relevant": False,
-        "moderation_reason": "",
-        "documents": [],
-        "answer": "",
-        "needs_retrieval": True,
     }
 
     async def event_generator():
