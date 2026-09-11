@@ -6,6 +6,7 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 
+from app.config import get_settings
 from app.graph.state import AgentState, DocumentInfo
 from app.graph.tools import vector_search
 from app.services.llm import get_llm, get_llm_with_structured_output
@@ -92,8 +93,8 @@ def rag_agent_node(state: AgentState) -> dict:
             if not getattr(m, "tool_calls", None) or (isinstance(m.content, str) and m.content.strip()):
                 history.append(m)
 
-    # Limit history length
-    history = history[-8:]
+    max_msgs = get_settings().history_max_messages
+    history = history[-max_msgs:] if max_msgs > 0 else history
 
     messages = [SystemMessage(content=system)] + history
     if not history or not isinstance(history[-1], HumanMessage) or history[-1].content != query:

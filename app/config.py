@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     chunk_overlap: int = 150
     top_k: int = 5
     score_threshold: float = 0.35
+    history_max_messages: int = 8
 
     # ----- App -----
     app_host: str = "0.0.0.0"
