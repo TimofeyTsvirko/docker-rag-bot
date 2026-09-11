@@ -1,3 +1,4 @@
+import json
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
@@ -98,9 +99,15 @@ def query(req: QueryRequest):
     )
 
 
+def _sse(event: str, data: Any) -> str:
+    """Proper Server-Sent Event frame: event + JSON data."""
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
-    """Streaming response (token-by-token for the final answer)."""
+    """True token streaming of the writer answer via LangGraph astream_events + SSE."""
     thread_id = req.thread_id or str(uuid.uuid4())
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
@@ -112,19 +119,72 @@ async def query_stream(req: QueryRequest):
     }
 
     async def event_generator():
+        final_state: Dict[str, Any] = {}
         try:
-            # We stream only the final answer for simplicity.
-            # Full event stream can be added later if needed.
-            result = graph.invoke(initial, config=config)
-            answer = result.get("answer", "")
-            # naive token stream
-            for token in answer.split(" "):
-                yield f"data: {token} \n\n"
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            yield f"data: [ERROR] {e}\n\n"
+            async for event in graph.astream_events(initial, config=config, version="v2"):
+                kind = event.get("event")
+                meta = event.get("metadata") or {}
+                node = meta.get("langgraph_node")
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+                if kind == "on_chat_model_stream" and node == "writer":
+                    chunk = (event.get("data") or {}).get("chunk")
+                    content = getattr(chunk, "content", None) if chunk is not None else None
+                    if content:
+                        if isinstance(content, list):
+                            text = "".join(
+                                p.get("text", "") if isinstance(p, dict) else str(p)
+                                for p in content
+                            )
+                        else:
+                            text = str(content)
+                        if text:
+                            yield _sse("token", {"content": text})
+
+                elif kind == "on_chain_end" and node == "writer":
+                    # Capture writer output for final metadata
+                    out = (event.get("data") or {}).get("output") or {}
+                    if isinstance(out, dict):
+                        final_state.update(out)
+
+                elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+                    # Full graph finished — merge final state if present
+                    out = (event.get("data") or {}).get("output") or {}
+                    if isinstance(out, dict):
+                        final_state.update(out)
+
+            docs = final_state.get("documents") or []
+            yield _sse(
+                "documents",
+                [
+                    {
+                        "content": d.get("content", "") if isinstance(d, dict) else getattr(d, "content", ""),
+                        "source": d.get("source", "") if isinstance(d, dict) else getattr(d, "source", ""),
+                        "score": d.get("score", 0.0) if isinstance(d, dict) else getattr(d, "score", 0.0),
+                    }
+                    for d in docs
+                ],
+            )
+            yield _sse(
+                "done",
+                {
+                    "thread_id": thread_id,
+                    "is_relevant": bool(final_state.get("is_relevant", False)),
+                    "answer": final_state.get("answer", ""),
+                },
+            )
+        except Exception as e:
+            logger.exception("Streaming graph failed")
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/ingest", response_model=IngestResponse)
